@@ -1,0 +1,10 @@
+
+cd "C:\Users\Prajwalp\Desktop\Computer Science\Intership\Edutainer\Project\Fyers Algo Data"
+
+.venv\Scripts\activate
+
+taskkill /F /IM python.exe
+
+python app.py
+
+flask run

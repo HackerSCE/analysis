@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FYERS POR Strategy Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">FYERS API V3</p>
+        <h1>POR Strategy Dashboard</h1>
+      </div>
+      <div class="auth">
+        {% if authenticated %}
+          <span class="status ok">Authenticated</span>
+          <button id="logoutBtn" class="ghost">Logout</button>
+        {% else %}
+          <span class="status">Not connected</span>
+          <a class="button" href="{{ url_for('login') }}">Login with FYERS</a>
+        {% endif %}
+      </div>
+    </header>
+
+    {% if config_errors %}
+      <section class="notice">
+        {% for error in config_errors %}
+          <p>{{ error }}</p>
+        {% endfor %}
+      </section>
+    {% endif %}
+
+    <section class="toolbar">
+      <div class="field symbol-field">
+        <label for="symbolInput">Symbol</label>
+        <input id="symbolInput" type="search" placeholder="NSE:SBIN-EQ or NSE:NIFTY24MAY22000CE" value="NSE:SBIN-EQ">
+      </div>
+      <div class="field">
+        <label for="dateFromInput">From</label>
+        <input id="dateFromInput" type="date" value="{{ default_start }}">
+      </div>
+      <div class="field">
+        <label for="dateToInput">To</label>
+        <input id="dateToInput" type="date" value="{{ default_end }}">
+      </div>
+      <div class="field">
+        <label for="sessionStartInput">Start</label>
+        <input id="sessionStartInput" type="time" value="09:15">
+      </div>
+      <div class="field">
+        <label for="signalStartInput">Signal</label>
+        <input id="signalStartInput" type="time" value="09:20">
+      </div>
+      <div class="field">
+        <label for="sessionExitInput">Exit</label>
+        <input id="sessionExitInput" type="time" value="15:15">
+      </div>
+      <button id="analyzeBtn">Analyze</button>
+      <button id="downloadBtn" class="ghost" disabled>Download Excel</button>
+    </section>
+
+    <section class="chart-area">
+      <div id="chart"></div>
+      <div id="emptyState">Enter a symbol and run analysis.</div>
+    </section>
+
+    <section class="metrics">
+      <article>
+        <span>Total P&amp;L</span>
+        <strong id="totalPnl">0.00</strong>
+      </article>
+      <article>
+        <span>Win Rate</span>
+        <strong id="winRate">0.00%</strong>
+      </article>
+      <article>
+        <span>Drawdown</span>
+        <strong id="drawdown">0.00</strong>
+      </article>
+      <article>
+        <span>Trades</span>
+        <strong id="tradeCount">0</strong>
+      </article>
+    </section>
+
+    <section class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Side</th>
+            <th>Entry</th>
+            <th>Entry Price</th>
+            <th>Exit</th>
+            <th>Exit Price</th>
+            <th>Reason</th>
+            <th>P&amp;L</th>
+          </tr>
+        </thead>
+        <tbody id="tradesBody">
+          <tr><td colspan="7">No trades loaded.</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
