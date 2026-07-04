@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NSE F&amp;O Live Analytics Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <script defer src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+</head>
+<body>
+  <main class="shell analytics-shell">
+    <header class="topbar analytics-topbar">
+      <div>
+        <p class="eyebrow">FYERS API V3</p>
+        <h1>NSE F&amp;O Live Analytics Dashboard</h1>
+      </div>
+      <div class="auth">
+        <a class="ghost button-like" href="{{ url_for('index') }}">POR Dashboard</a>
+        <a class="ghost button-like" href="{{ url_for('indicator_screener') }}">Open Indicator Screener</a>
+        {% if authenticated %}
+          <span class="status ok">Authenticated</span>
+          <button id="logoutBtn" class="ghost">Logout</button>
+        {% else %}
+          <span class="status">Not connected</span>
+          <a class="button" href="{{ url_for('login') }}">Login with FYERS</a>
+        {% endif %}
+      </div>
+    </header>
+
+    <section class="toolbar fyers-auth-panel">
+      <div class="field">
+        <label for="fyersClientId">Client ID</label>
+        <input id="fyersClientId" type="text" autocomplete="off" placeholder="FYERS Client ID" value="{{ fyers_client_id }}">
+      </div>
+      <div class="field">
+        <label for="fyersSecretKey">Secret Key</label>
+        <input id="fyersSecretKey" type="password" autocomplete="off" placeholder="FYERS Secret Key">
+      </div>
+      <div class="field">
+        <label for="fyersRedirectUri">Redirect URI</label>
+        <input id="fyersRedirectUri" type="url" autocomplete="off" placeholder="FYERS Redirect URI" value="{{ fyers_redirect_uri }}">
+      </div>
+      <button id="saveFyersConfigBtn" type="button">Save Credentials</button>
+      <button id="clearFyersConfigBtn" class="ghost" type="button">Clear</button>
+      <span id="fyersConfigStatus" class="status{% if fyers_configured %} ok{% endif %}">{{ "Runtime" if fyers_config_source == "runtime" else "Environment" if fyers_config_source == "env" else "Not configured" }}</span>
+    </section>
+
+    {% if config_errors %}
+      <section class="notice">
+        {% for error in config_errors %}
+          <p>{{ error }}</p>
+        {% endfor %}
+      </section>
+    {% endif %}
+
+    <section class="analytics-status-panel">
+      <div class="analytics-live">
+        <span class="live-dot" aria-hidden="true"></span>
+        <span>Live</span>
+      </div>
+      <div class="analytics-refresh-meta">
+        <span>Last Updated: <strong id="lastUpdated">--</strong></span>
+        <span>Next Refresh: <strong id="nextRefresh">--</strong></span>
+      </div>
+    </section>
+
+    <section class="metrics analytics-summary">
+      <article>
+        <span>Total Stocks</span>
+        <strong id="totalStocks">0</strong>
+      </article>
+      <article>
+        <span>Average Near Premium %</span>
+        <strong id="averageNearPremium">0.00%</strong>
+      </article>
+      <article>
+        <span>Highest Premium Stock</span>
+        <strong id="highestPremiumStock">--</strong>
+      </article>
+      <article>
+        <span>Highest Discount Stock</span>
+        <strong id="highestDiscountStock">--</strong>
+      </article>
+      <article>
+        <span>Total Market Contract Value</span>
+        <strong id="totalMarketContractValue">0.00</strong>
+      </article>
+    </section>
+
+    <section class="toolbar analytics-toolbar">
+      <div class="field analytics-search-field">
+        <label for="stockSearchInput">Search Symbol</label>
+        <input id="stockSearchInput" type="search" placeholder="RELIANCE, SBIN, HDFCBANK">
+      </div>
+      <div class="field">
+        <label for="premiumFilterSelect">Filter</label>
+        <select id="premiumFilterSelect">
+          <option value="all">All contracts</option>
+          <option value="nearPremium">Near premium</option>
+          <option value="nearDiscount">Near discount</option>
+          <option value="allPremium">All futures premium</option>
+          <option value="allDiscount">All futures discount</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="sortColumnSelect">Sort By</label>
+        <select id="sortColumnSelect">
+          <option value="nearDiffPct">% Difference Near</option>
+          <option value="nextDiffPct">% Difference Next</option>
+          <option value="farDiffPct">% Difference Far</option>
+          <option value="contractValue">Contract Value</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="sortDirectionSelect">Direction</label>
+        <select id="sortDirectionSelect">
+          <option value="desc">Highest to Lowest</option>
+          <option value="asc">Lowest to Highest</option>
+        </select>
+      </div>
+      <button id="refreshBtn">Refresh Now</button>
+      <button id="downloadAnalyticsBtn" class="ghost" disabled>Download Excel</button>
+    </section>
+
+    <section class="quick-filters" aria-label="Quick filters">
+      <button class="ghost quick-filter active" type="button" data-filter="all">All Stocks</button>
+      <button class="ghost quick-filter" type="button" data-filter="topPremium">Top Gainers Futures Premium</button>
+      <button class="ghost quick-filter" type="button" data-filter="highestDiscount">Highest Discount</button>
+      <button class="ghost quick-filter" type="button" data-filter="highestContractValue">Highest Contract Value</button>
+      <button class="ghost quick-filter" type="button" data-filter="lowestContractValue">Lowest Contract Value</button>
+    </section>
+
+    <section id="analyticsError" class="notice analytics-error" hidden></section>
+
+    <section class="table-wrap analytics-table-panel">
+      <div class="analytics-table-meta">
+        <span id="tableStatus">Loading live FYERS quotes...</span>
+        <span id="rowCount">0 rows</span>
+      </div>
+      <div class="analytics-table-scroll">
+        <table class="analytics-table">
+          <thead>
+            <tr>
+              <th>NSE Stock Name</th>
+              <th>Spot Price</th>
+              <th>Near Month Future Price</th>
+              <th>Next Month Future Price</th>
+              <th>Far Month Future Price</th>
+              <th>% Difference (Near Future - Spot)</th>
+              <th>% Difference (Next Future - Spot)</th>
+              <th>% Difference (Far Future - Spot)</th>
+              <th>Lot Size</th>
+              <th>Contract Value</th>
+            </tr>
+          </thead>
+          <tbody id="analyticsTableBody">
+            <tr><td colspan="10">Loading live FYERS quotes...</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="analytics-pagination">
+        <div class="field page-size-field">
+          <label for="pageSizeSelect">Rows</label>
+          <select id="pageSizeSelect">
+            <option value="50">50</option>
+            <option value="100">100</option>
+            <option value="all">All</option>
+          </select>
+        </div>
+        <div class="pagination-buttons">
+          <button id="prevPageBtn" class="ghost" type="button">Previous</button>
+          <span id="pageInfo">Page 1 of 1</span>
+          <button id="nextPageBtn" class="ghost" type="button">Next</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script defer src="{{ url_for('static', filename='fyers_auth.js') }}"></script>
+  <script type="module" src="{{ url_for('static', filename='nse_fno_analytics.js') }}"></script>
+</body>
+</html>

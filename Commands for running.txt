@@ -1,6 +1,8 @@
 
 cd "C:\Users\Prajwalp\Desktop\Computer Science\Intership\Edutainer\Project\Fyers Algo Data"
 
+cd "C:\Users\Prajwalp\Desktop\Computer Science\Intership\Edutainer\Project\Fyers Algo Data - old - 1"
+
 .venv\Scripts\activate
 
 taskkill /F /IM python.exe

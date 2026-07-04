@@ -15,6 +15,8 @@
         <h1>POR Strategy Dashboard</h1>
       </div>
       <div class="auth">
+        <a class="button" href="{{ url_for('nse_fno_analytics') }}">Open NSE F&amp;O Analytics Dashboard</a>
+        <a class="button" href="{{ url_for('indicator_screener') }}">Open Indicator Screener</a>
         {% if authenticated %}
           <span class="status ok">Authenticated</span>
           <button id="logoutBtn" class="ghost">Logout</button>
@@ -24,6 +26,24 @@
         {% endif %}
       </div>
     </header>
+
+    <section class="toolbar fyers-auth-panel">
+      <div class="field">
+        <label for="fyersClientId">Client ID</label>
+        <input id="fyersClientId" type="text" autocomplete="off" placeholder="FYERS Client ID" value="{{ fyers_client_id }}">
+      </div>
+      <div class="field">
+        <label for="fyersSecretKey">Secret Key</label>
+        <input id="fyersSecretKey" type="password" autocomplete="off" placeholder="FYERS Secret Key">
+      </div>
+      <div class="field">
+        <label for="fyersRedirectUri">Redirect URI</label>
+        <input id="fyersRedirectUri" type="url" autocomplete="off" placeholder="FYERS Redirect URI" value="{{ fyers_redirect_uri }}">
+      </div>
+      <button id="saveFyersConfigBtn" type="button">Save Credentials</button>
+      <button id="clearFyersConfigBtn" class="ghost" type="button">Clear</button>
+      <span id="fyersConfigStatus" class="status{% if fyers_configured %} ok{% endif %}">{{ "Runtime" if fyers_config_source == "runtime" else "Environment" if fyers_config_source == "env" else "Not configured" }}</span>
+    </section>
 
     {% if config_errors %}
       <section class="notice">
@@ -36,7 +56,11 @@
     <section class="toolbar">
       <div class="field symbol-field">
         <label for="symbolInput">Symbol</label>
-        <input id="symbolInput" type="search" placeholder="NSE:SBIN-EQ or NSE:NIFTY24MAY22000CE" value="NSE:SBIN-EQ">
+        <div class="symbol-input-wrap">
+          <input id="symbolInput" type="search" placeholder="NSE:SBIN-EQ or NSE:NIFTY24MAY22000CE" value="NSE:SBIN-EQ" autocomplete="off" aria-autocomplete="list" aria-expanded="false" aria-controls="symbolSuggestions">
+          <button id="symbolClearBtn" class="symbol-clear-btn" type="button" aria-label="Clear symbol">×</button>
+          <div id="symbolSuggestions" class="symbol-suggestions" role="listbox" aria-label="Symbol suggestions" hidden></div>
+        </div>
       </div>
       <div class="field">
         <label for="dateFromInput">From</label>
@@ -106,6 +130,7 @@
     </section>
   </main>
 
+  <script defer src="{{ url_for('static', filename='fyers_auth.js') }}"></script>
   <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>

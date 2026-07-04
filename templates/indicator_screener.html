@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Advanced F&amp;O Indicator Screener</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body class="screener-body">
+  <main class="shell screener-shell">
+    <header class="topbar screener-topbar">
+      <div>
+        <p class="eyebrow">Institutional NSE F&amp;O Scanner</p>
+        <h1>Advanced F&amp;O Indicator Screener</h1>
+      </div>
+      <div class="auth screener-nav">
+        <a class="ghost button-like" href="{{ url_for('index') }}">Back to Dashboard</a>
+        <a class="ghost button-like" href="{{ url_for('nse_fno_analytics') }}">Back to NSE Analytics</a>
+        {% if authenticated %}
+          <span class="status ok">Authenticated</span>
+          <button id="logoutBtn" class="ghost">Logout</button>
+        {% else %}
+          <span class="status">Not connected</span>
+          <a class="button" href="{{ url_for('login') }}">Login with FYERS</a>
+        {% endif %}
+      </div>
+    </header>
+
+    <section class="toolbar fyers-auth-panel">
+      <div class="field">
+        <label for="fyersClientId">Client ID</label>
+        <input id="fyersClientId" type="text" autocomplete="off" placeholder="FYERS Client ID" value="{{ fyers_client_id }}">
+      </div>
+      <div class="field">
+        <label for="fyersSecretKey">Secret Key</label>
+        <input id="fyersSecretKey" type="password" autocomplete="off" placeholder="FYERS Secret Key">
+      </div>
+      <div class="field">
+        <label for="fyersRedirectUri">Redirect URI</label>
+        <input id="fyersRedirectUri" type="url" autocomplete="off" placeholder="FYERS Redirect URI" value="{{ fyers_redirect_uri }}">
+      </div>
+      <button id="saveFyersConfigBtn" type="button">Save Credentials</button>
+      <button id="clearFyersConfigBtn" class="ghost" type="button">Clear</button>
+      <span id="fyersConfigStatus" class="status{% if fyers_configured %} ok{% endif %}">{{ "Runtime" if fyers_config_source == "runtime" else "Environment" if fyers_config_source == "env" else "Not configured" }}</span>
+    </section>
+
+    {% if config_errors %}
+      <section class="notice">
+        {% for error in config_errors %}
+          <p>{{ error }}</p>
+        {% endfor %}
+      </section>
+    {% endif %}
+
+    <section class="screener-market-strip">
+      <div class="analytics-live">
+        <span class="live-dot" aria-hidden="true"></span>
+        <span>Live Scanner</span>
+      </div>
+      <div class="analytics-refresh-meta">
+        <span>Last Updated: <strong id="screenerLastUpdated">--</strong></span>
+        <span>Next Refresh: <strong id="screenerNextRefresh">--</strong></span>
+        <span>Scan Latency: <strong id="scanLatency">--</strong></span>
+      </div>
+    </section>
+
+    <section class="metrics screener-summary">
+      <article>
+        <span>Total Stocks Scanned</span>
+        <strong id="totalStocksScanned">0</strong>
+      </article>
+      <article>
+        <span>Matching Results</span>
+        <strong id="matchingResults">0</strong>
+      </article>
+      <article>
+        <span>Bullish Signals</span>
+        <strong id="bullishSignals">0</strong>
+      </article>
+      <article>
+        <span>Bearish Signals</span>
+        <strong id="bearishSignals">0</strong>
+      </article>
+      <article>
+        <span>Strongest Momentum Stock</span>
+        <strong id="strongestMomentumStock">--</strong>
+      </article>
+      <article>
+        <span>Highest ADX Stock</span>
+        <strong id="highestAdxStock">--</strong>
+      </article>
+      <article>
+        <span>Highest Volume Breakout</span>
+        <strong id="highestVolumeBreakout">--</strong>
+      </article>
+    </section>
+
+    <section class="screener-workspace">
+      <aside class="screener-controls" aria-label="Screener controls">
+        <section class="screener-panel">
+          <div class="screener-panel-heading">
+            <span>Universe</span>
+            <small id="catalogStatus">Loading F&amp;O catalog...</small>
+          </div>
+          <div class="field">
+            <label>Instrument Type</label>
+            <div id="instrumentTypeChips" class="chip-grid"></div>
+          </div>
+          <div class="field">
+            <label>Sector Selection</label>
+            <div id="sectorChips" class="chip-grid sector-chip-grid"></div>
+          </div>
+          <div class="field">
+            <label for="timeframeSelect">Timeframe</label>
+            <select id="timeframeSelect"></select>
+          </div>
+        </section>
+
+        <section class="screener-panel">
+          <div class="screener-panel-heading">
+            <span>Quick Presets</span>
+            <small>Desk-ready templates</small>
+          </div>
+          <div id="presetButtons" class="preset-grid"></div>
+        </section>
+
+        <section class="screener-panel">
+          <div class="screener-panel-heading">
+            <span>Saved Scans</span>
+            <small>Local workspace</small>
+          </div>
+          <div class="saved-scan-row">
+            <input id="saveScanName" type="text" placeholder="Scanner name">
+            <button id="saveScanBtn" type="button">Save Scanner</button>
+          </div>
+          <div class="saved-scan-row">
+            <select id="savedScanSelect"></select>
+            <button id="loadScanBtn" class="ghost" type="button">Load</button>
+            <button id="deleteScanBtn" class="ghost danger-ghost" type="button">Delete</button>
+          </div>
+        </section>
+      </aside>
+
+      <section class="screener-main">
+        <section class="screener-panel condition-panel">
+          <div class="screener-panel-heading condition-heading">
+            <div>
+              <span>Indicator Condition Builder</span>
+              <small>Combine multiple signals with institutional scan logic</small>
+            </div>
+            <div class="logic-toggle" aria-label="Condition logic">
+              <button id="andLogicBtn" class="logic-button active" type="button" data-logic="AND">AND</button>
+              <button id="orLogicBtn" class="logic-button" type="button" data-logic="OR">OR</button>
+            </div>
+          </div>
+          <div id="conditionsList" class="conditions-list"></div>
+          <div class="condition-actions">
+            <button id="addConditionBtn" class="ghost" type="button">Add Condition</button>
+            <button id="runScanBtn" type="button">Run Scan</button>
+            <label class="auto-refresh-toggle">
+              <input id="autoRefreshToggle" type="checkbox" checked>
+              <span>Auto refresh every 60s</span>
+            </label>
+          </div>
+        </section>
+
+        <section id="screenerMessage" class="notice analytics-error" hidden></section>
+
+        <section class="screener-results-panel">
+          <div class="screener-results-toolbar">
+            <div class="field results-search-field">
+              <label for="screenerSearchInput">Search</label>
+              <input id="screenerSearchInput" type="search" placeholder="RELIANCE, Banking, Bullish">
+            </div>
+            <div class="field">
+              <label for="signalFilterSelect">Signal</label>
+              <select id="signalFilterSelect">
+                <option value="all">All Signals</option>
+                <option value="Bullish">Bullish</option>
+                <option value="Bearish">Bearish</option>
+                <option value="Neutral">Neutral</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="screenerSortSelect">Sort By</label>
+              <select id="screenerSortSelect">
+                <option value="signalScore">Signal Strength</option>
+                <option value="rsi">RSI</option>
+                <option value="adx">ADX</option>
+                <option value="volumeBreakoutRatio">Volume Breakout</option>
+                <option value="currentPrice">Current Price</option>
+              </select>
+            </div>
+            <button id="refreshScreenerBtn" class="ghost" type="button">Refresh Now</button>
+            <button id="exportExcelBtn" class="ghost" type="button" disabled>Export Excel</button>
+            <button id="exportCsvBtn" class="ghost" type="button" disabled>Export CSV</button>
+          </div>
+
+          <div class="analytics-table-meta screener-table-meta">
+            <span id="screenerTableStatus">Configure filters and run a scan.</span>
+            <span id="screenerRowCount">0 rows</span>
+          </div>
+
+          <div class="screener-table-scroll">
+            <table class="screener-table">
+              <thead>
+                <tr>
+                  <th>Stock Name</th>
+                  <th>Sector</th>
+                  <th>Instrument Type</th>
+                  <th>Current Price</th>
+                  <th>RSI</th>
+                  <th>ADX</th>
+                  <th>Supertrend Status</th>
+                  <th>VWAP Status</th>
+                  <th>Bollinger Status</th>
+                  <th>Signal Strength</th>
+                  <th>Timeframe</th>
+                  <th>Volume</th>
+                  <th>Last Updated</th>
+                </tr>
+              </thead>
+              <tbody id="screenerTableBody">
+                <tr><td colspan="13">No scan results yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="analytics-pagination screener-pagination">
+            <div class="field page-size-field">
+              <label for="screenerPageSizeSelect">Rows</label>
+              <select id="screenerPageSizeSelect">
+                <option value="25">25</option>
+                <option value="50">50</option>
+                <option value="100">100</option>
+                <option value="all">All</option>
+              </select>
+            </div>
+            <div class="pagination-buttons">
+              <button id="screenerPrevPageBtn" class="ghost" type="button">Previous</button>
+              <span id="screenerPageInfo">Page 1 of 1</span>
+              <button id="screenerNextPageBtn" class="ghost" type="button">Next</button>
+            </div>
+          </div>
+        </section>
+      </section>
+    </section>
+  </main>
+
+  <script defer src="{{ url_for('static', filename='fyers_auth.js') }}"></script>
+  <script type="module" src="{{ url_for('static', filename='indicator_screener.js') }}"></script>
+</body>
+</html>
