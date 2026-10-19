@@ -15,8 +15,7 @@
         <h1>NSE F&amp;O Live Analytics Dashboard</h1>
       </div>
       <div class="auth">
-        <a class="ghost button-like" href="{{ url_for('index') }}">POR Dashboard</a>
-        <a class="ghost button-like" href="{{ url_for('indicator_screener') }}">Open Indicator Screener</a>
+        <a class="ghost button-like" href="{{ url_for('arbitrage_calculator') }}">Arbitrage Calculator</a>
         {% if authenticated %}
           <span class="status ok">Authenticated</span>
           <button id="logoutBtn" class="ghost">Logout</button>

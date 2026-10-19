@@ -1,12 +1,6 @@
 
-cd "C:\Users\Prajwalp\Desktop\Computer Science\Intership\Edutainer\Project\Fyers Algo Data"
-
-cd "C:\Users\Prajwalp\Desktop\Computer Science\Intership\Edutainer\Project\Fyers Algo Data - old - 1"
+cd "C:\Users\Prajwalp\Desktop\Computer Science\Intership\Edutainer\Project\Fyers Algo Data - old - 3 - Only F&O"
 
 .venv\Scripts\activate
 
-taskkill /F /IM python.exe
-
 python app.py
-
-flask run

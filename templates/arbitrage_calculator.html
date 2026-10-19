@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Arbitrage Calculator</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <main class="shell analytics-shell arbitrage-shell" data-authenticated="{{ 'true' if authenticated else 'false' }}">
+    <header class="topbar analytics-topbar">
+      <div>
+        <p class="eyebrow">FYERS API V3</p>
+        <h1>Live Futures Difference Calculator</h1>
+      </div>
+      <div class="auth">
+        <a class="ghost button-like" href="{{ url_for('index') }}">NSE F&amp;O Analytics</a>
+        {% if authenticated %}
+          <span class="status ok">Authenticated</span>
+          <button id="logoutBtn" class="ghost">Logout</button>
+        {% else %}
+          <span class="status">Not connected</span>
+          <a class="button" href="{{ url_for('login') }}">Login with FYERS</a>
+        {% endif %}
+      </div>
+    </header>
+
+    <section class="toolbar fyers-auth-panel">
+      <div class="field">
+        <label for="fyersClientId">Client ID</label>
+        <input id="fyersClientId" type="text" autocomplete="off" placeholder="FYERS Client ID" value="{{ fyers_client_id }}">
+      </div>
+      <div class="field">
+        <label for="fyersSecretKey">Secret Key</label>
+        <input id="fyersSecretKey" type="password" autocomplete="off" placeholder="FYERS Secret Key">
+      </div>
+      <div class="field">
+        <label for="fyersRedirectUri">Redirect URI</label>
+        <input id="fyersRedirectUri" type="url" autocomplete="off" placeholder="FYERS Redirect URI" value="{{ fyers_redirect_uri }}">
+      </div>
+      <button id="saveFyersConfigBtn" type="button">Save Credentials</button>
+      <button id="clearFyersConfigBtn" class="ghost" type="button">Clear</button>
+      <span id="fyersConfigStatus" class="status{% if fyers_configured %} ok{% endif %}">{{ "Runtime" if fyers_config_source == "runtime" else "Environment" if fyers_config_source == "env" else "Not configured" }}</span>
+    </section>
+
+    {% if config_errors %}
+      <section class="notice">
+        {% for error in config_errors %}
+          <p>{{ error }}</p>
+        {% endfor %}
+      </section>
+    {% endif %}
+
+    <section class="analytics-status-panel">
+      <div class="analytics-live">
+        <span class="live-dot" aria-hidden="true"></span>
+        <span>Live Calculator</span>
+      </div>
+      <div class="analytics-refresh-meta">
+        <span>Catalog: <strong id="metadataStatus">Loading...</strong></span>
+        <span>Calculated: <strong id="calculatedAt">--</strong></span>
+        <span>Next refresh: <strong id="nextRefresh">Calculate to start</strong></span>
+      </div>
+    </section>
+
+    <section class="toolbar analytics-toolbar arbitrage-trade-panel">
+      <div class="field">
+        <label for="marketTypeSelect">Calculation</label>
+        <select id="marketTypeSelect">
+          <option value="equity">Equity cash &amp; stock future</option>
+          <option value="commodity">Commodity futures spread</option>
+        </select>
+      </div>
+      <div class="field analytics-search-field">
+        <label id="buyInstrumentLabel" for="buyStockInput">BUY Stock Name</label>
+        <input id="buyStockInput" type="search" list="arbitrageInstrumentOptions" placeholder="RELIANCE">
+      </div>
+      <div id="buyExpiryField" class="field" hidden>
+        <label for="buyFutureExpirySelect">BUY Future Expiry</label>
+        <select id="buyFutureExpirySelect"></select>
+      </div>
+      <div class="field analytics-search-field">
+        <label id="sellInstrumentLabel" for="sellFutureInput">SELL Stock Future</label>
+        <input id="sellFutureInput" type="search" list="arbitrageInstrumentOptions" placeholder="RELIANCE">
+      </div>
+      <div class="field">
+        <label id="sellExpiryLabel" for="futureExpirySelect">SELL Future Expiry</label>
+        <select id="futureExpirySelect"></select>
+      </div>
+      <div class="field compact-number-field">
+        <label for="lotsInput">Lots</label>
+        <input id="lotsInput" type="number" min="1" step="1" value="1">
+      </div>
+      <div id="commodityClassField" class="field" hidden>
+        <label for="commodityClassSelect">Commodity Class</label>
+        <select id="commodityClassSelect">
+          <option value="non_agri">Non-agri</option>
+          <option value="agri">Agri</option>
+        </select>
+      </div>
+      <div id="settlementPriceField" class="field compact-number-field">
+        <label for="settlementPriceInput">Settlement (optional)</label>
+        <input id="settlementPriceInput" type="number" min="0" step="0.05" placeholder="Auto at spot">
+      </div>
+      <button id="calculateArbitrageBtn" type="button">Calculate</button>
+      <datalist id="arbitrageInstrumentOptions"></datalist>
+    </section>
+
+    <section class="toolbar arbitrage-charge-rules" aria-label="Automatic charge rules">
+      <div>
+        <strong>Charges calculated automatically</strong>
+        <p id="chargeRulesDescription">Loading FYERS charge rules...</p>
+      </div>
+      <ul id="chargeRulesList"></ul>
+    </section>
+
+    <section id="arbitrageMessage" class="notice analytics-error" hidden></section>
+
+    <section class="metrics analytics-summary arbitrage-summary">
+      <article>
+        <span id="cashRequiredLabel">Cash Required</span>
+        <strong id="cashRequired">--</strong>
+      </article>
+      <article>
+        <span id="netProfitLabel">Expected Net Profit</span>
+        <strong id="netProfit">--</strong>
+      </article>
+      <article>
+        <span id="netReturnLabel">Net Return</span>
+        <strong id="netReturn">--</strong>
+      </article>
+      <article>
+        <span id="annualizedReturnLabel">Annualized Return</span>
+        <strong id="annualizedReturn">--</strong>
+      </article>
+      <article>
+        <span id="totalChargesLabel">Total Charges</span>
+        <strong id="totalCharges">--</strong>
+      </article>
+    </section>
+
+    <section class="arbitrage-results-grid">
+      <section class="table-wrap arbitrage-table-panel">
+        <div class="analytics-table-meta">
+          <span>Trade Snapshot</span>
+          <span id="selectedContract">--</span>
+        </div>
+        <table class="arbitrage-table">
+          <tbody id="tradeSnapshotBody">
+            <tr><td colspan="2">Run a calculation.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="table-wrap arbitrage-table-panel">
+        <div class="analytics-table-meta">
+          <span>Charges Breakdown</span>
+          <span id="chargeTotalMeta">--</span>
+        </div>
+        <table class="arbitrage-table">
+          <tbody id="chargesBreakdownBody">
+            <tr><td colspan="2">Run a calculation.</td></tr>
+          </tbody>
+        </table>
+      </section>
+    </section>
+  </main>
+
+  <script defer src="{{ url_for('static', filename='fyers_auth.js') }}"></script>
+  <script type="module" src="{{ url_for('static', filename='arbitrage_calculator.js') }}"></script>
+</body>
+</html>

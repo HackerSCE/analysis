@@ -80,6 +80,25 @@ utils/
    - `http://127.0.0.1:5000/nse-fno-analytics`
    - `http://127.0.0.1:5000/indicator-screener`
 
+## Render Deployment
+
+Render should run this app on Python 3.12, not 3.14. The repo includes a `.python-version` file for that reason, because `pandas` can fail to build from source on newer runtimes.
+
+Recommended Render settings:
+
+- **Build Command**: `pip install -r requirements.txt`
+- **Start Command**: `gunicorn app:app --bind 0.0.0.0:$PORT`
+- **Environment Variables**:
+  - `FLASK_SECRET_KEY`
+  - `FYERS_CLIENT_ID`
+  - `FYERS_SECRET_KEY`
+  - `FYERS_REDIRECT_URI`
+- **Optional**: `FYERS_STARTUP_DIAGNOSTICS=0`
+
+If you create the service from the dashboard, also make sure the callback URL in FYERS points to:
+
+`https://<your-render-service>.onrender.com/callback`
+
 ## Environment
 
 The sample environment files define these values:

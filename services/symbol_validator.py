@@ -33,6 +33,11 @@ MASTER_SOURCES = {
         "logical_exchange": "NFO",
         "group": "derivative",
     },
+    "NSE_COM": {
+        "url": "https://public.fyers.in/sym_details/NSE_COM.csv",
+        "logical_exchange": "NSE",
+        "group": "commodity",
+    },
     "NSE_CD": {
         "url": "https://public.fyers.in/sym_details/NSE_CD.csv",
         "logical_exchange": "CDS",
@@ -312,13 +317,13 @@ def _infer_instrument(symbol, source_name, instrument_code):
     code = str(instrument_code or "").strip()
 
     if symbol.endswith("FUT"):
-        if source_name == "MCX_COM":
+        if source_name in {"MCX_COM", "NSE_COM"}:
             return "FUTCOM"
         if source_name == "NSE_CD":
             return "FUTCUR"
         return "FUT"
     if symbol.endswith("CE") or symbol.endswith("PE"):
-        if source_name == "MCX_COM":
+        if source_name in {"MCX_COM", "NSE_COM"}:
             return "OPTCOM"
         if source_name == "NSE_CD":
             return "OPTCUR"

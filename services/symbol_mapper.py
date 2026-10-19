@@ -15,9 +15,12 @@ logger = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
 FYERS_NSE_FO_SYMBOL_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 FYERS_NSE_CM_SYMBOL_MASTER_URL = "https://public.fyers.in/sym_details/NSE_CM.csv"
+FYERS_NSE_COM_SYMBOL_MASTER_URL = "https://public.fyers.in/sym_details/NSE_COM.csv"
+FYERS_MCX_COM_SYMBOL_MASTER_URL = "https://public.fyers.in/sym_details/MCX_COM.csv"
 SYMBOL_MASTER_CACHE_SECONDS = 6 * 60 * 60
 
 _catalog_cache = {"loaded_at": 0, "payload": None}
+_commodity_catalog_cache = {"loaded_at": 0, "payload": None}
 
 
 def build_fno_contract_catalog():
@@ -82,6 +85,79 @@ def build_fno_contract_catalog():
         "FYERS symbol catalog loaded: fno_items=%s spot_symbols=%s expired_futures_skipped=%s",
         len(items),
         len(spot_by_symbol),
+        expired_contracts_skipped,
+    )
+    return payload
+
+
+def build_commodity_futures_catalog():
+    """Build a current commodity-futures catalog from FYERS' NSE and MCX masters.
+
+    Commodity futures do not have a cash-market counterpart in the NSE CM
+    master, so each entry intentionally represents the futures contracts for a
+    commodity rather than trying to manufacture a spot symbol.
+    """
+    now = time.time()
+    cached = _commodity_catalog_cache.get("payload")
+    if cached and now - _commodity_catalog_cache.get("loaded_at", 0) < SYMBOL_MASTER_CACHE_SECONDS:
+        logger.info("FYERS commodity catalog cache hit: %s instruments", len(cached.get("items", [])))
+        return cached
+
+    logger.info("Loading FYERS symbol masters for NSE and MCX commodities")
+    source_rows = []
+    for exchange, source_url in (
+        ("MCX", FYERS_MCX_COM_SYMBOL_MASTER_URL),
+        ("NSE", FYERS_NSE_COM_SYMBOL_MASTER_URL),
+    ):
+        try:
+            source_rows.append((exchange, read_fyers_symbol_master(source_url)))
+        except Exception as exc:
+            logger.warning("Unable to load FYERS %s commodity master: %s", exchange, exc)
+    if not source_rows:
+        raise RuntimeError("FYERS commodity symbol masters are currently unavailable.")
+    futures_by_instrument = {}
+    expired_contracts_skipped = 0
+    current_ts = time.time()
+
+    for exchange, rows in source_rows:
+        for row in rows:
+            contract = parse_commodity_future_contract(row, exchange)
+            if not contract:
+                continue
+            key = (exchange, contract["symbol"])
+            futures_by_instrument.setdefault(key, []).append(contract)
+
+    items = []
+    for (exchange, symbol), contracts in futures_by_instrument.items():
+        live_contracts = [contract for contract in contracts if contract["expiry_ts"] >= current_ts]
+        expired_contracts_skipped += len(contracts) - len(live_contracts)
+        live_contracts = dedupe_contracts_by_symbol(sorted(live_contracts, key=lambda contract: contract["expiry_ts"]))
+        if not live_contracts:
+            continue
+
+        items.append({
+            "symbol": f"{exchange}:{symbol}",
+            "root_symbol": symbol,
+            "stock_name": symbol,
+            "exchange": exchange,
+            "lot_size": live_contracts[0]["lot_size"],
+            "contracts": {
+                f"contract_{index + 1}": contract
+                for index, contract in enumerate(live_contracts)
+            },
+        })
+
+    payload = {
+        "loaded_at": datetime.now(IST).isoformat(),
+        "contract_count": sum(len(value) for value in futures_by_instrument.values()),
+        "expired_contracts_skipped": expired_contracts_skipped,
+        "items": sorted(items, key=lambda item: (item["exchange"], item["root_symbol"])),
+    }
+    _commodity_catalog_cache["loaded_at"] = now
+    _commodity_catalog_cache["payload"] = payload
+    logger.info(
+        "FYERS commodity catalog loaded: commodity_items=%s expired_futures_skipped=%s",
+        len(items),
         expired_contracts_skipped,
     )
     return payload
@@ -153,6 +229,34 @@ def parse_fno_future_contract(row):
         "expiry_ts": expiry_ts,
         "expiry": datetime.fromtimestamp(expiry_ts, IST).strftime("%d %b %Y"),
         "underlying_fytoken": row[17].strip(),
+    }
+
+
+def parse_commodity_future_contract(row, expected_exchange):
+    if len(row) < 18:
+        return None
+
+    fyers_symbol = row[9].strip()
+    if not (
+        fyers_symbol.startswith(f"{expected_exchange}:")
+        and fyers_symbol.endswith("FUT")
+        and row[16].strip() == "XX"
+    ):
+        return None
+
+    expiry_ts = parse_float(row[8])
+    root_symbol = clean_root_symbol(row[13])
+    if not expiry_ts or not root_symbol:
+        return None
+
+    return {
+        "name": row[1].strip() or root_symbol,
+        "symbol": root_symbol,
+        "fyers_symbol": fyers_symbol,
+        "lot_size": int(parse_float(row[3]) or 0),
+        "expiry_ts": expiry_ts,
+        "expiry": datetime.fromtimestamp(expiry_ts, IST).strftime("%d %b %Y"),
+        "exchange": expected_exchange,
     }
 
 

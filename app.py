@@ -1,13 +1,11 @@
 import logging
 import os
 import time
-from datetime import date, datetime, timedelta
-from io import BytesIO
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import pandas as pd
 from dotenv import load_dotenv
-from flask import Flask, jsonify, redirect, render_template, request, send_file, session, url_for
+from flask import Flask, jsonify, redirect, render_template, request, session, url_for
 
 from services.fyers_credentials import (
     clear_fyers_config,
@@ -15,16 +13,16 @@ from services.fyers_credentials import (
     get_fyers_config,
     save_fyers_config,
 )
-from services.screener_service import get_screener_metadata, run_indicator_screener
 from services.symbol_search import search_symbols
 from services.symbol_resolver import resolve_symbol
 from services.symbol_mapper import (
     FYERS_NSE_CM_SYMBOL_MASTER_URL,
     FYERS_NSE_FO_SYMBOL_MASTER_URL,
+    build_commodity_futures_catalog,
     build_fno_contract_catalog,
+    clean_root_symbol,
 )
 from services.symbol_validator import detect_exchange, get_symbol_master_lookup, startup_master_diagnostics, validate_symbol
-from strategy import build_chart_payload, run_por_backtest
 from utils.batching import batch_values, unique_preserve_order
 
 try:
@@ -50,9 +48,37 @@ logger = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
 QUOTE_CHUNK_SIZE = 50
 QUOTE_CHUNK_PAUSE_SECONDS = 1.2
+ARBITRAGE_AUTO_REFRESH_SECONDS = 30
+EQUITY_CASH_FUTURES_RATES = {
+    "equitySttBuyPct": 0.1,
+    "equitySttSellPct": 0.1,
+    "futuresSttSellPct": 0.05,
+    "equityStampBuyPct": 0.015,
+    "futuresStampBuyPct": 0.002,
+    "equityExchangePct": 0.00307,
+    "futuresExchangePct": 0.00183,
+    "sebiTurnoverPct": 0.0001,
+    "gstPct": 18,
+    "futuresBrokeragePct": 0.03,
+    "futuresBrokerageCapPerOrder": 20,
+    "futuresMarginPct": 20,
+}
+COMMODITY_FUTURES_RATES = {
+    "futuresCttSellPct": 0.01,
+    "futuresStampBuyPct": 0.002,
+    "mcxExchangePct": 0.0021,
+    "nseCommodityExchangePct": 0.0001,
+    "sebiAgriTurnoverPct": 0.00001,
+    "sebiNonAgriTurnoverPct": 0.0001,
+    "gstPct": 18,
+    "futuresBrokeragePct": 0.03,
+    "futuresBrokerageCapPerOrder": 20,
+    "futuresMarginPct": 20,
+}
 
 try:
-    startup_master_diagnostics()
+    if os.getenv("FYERS_STARTUP_DIAGNOSTICS", "0").lower() in {"1", "true", "yes"}:
+        startup_master_diagnostics()
 except Exception as exc:
     logger.warning("Startup symbol-master diagnostics failed: %s", exc)
 
@@ -113,21 +139,6 @@ def make_fyers_client(token=None):
 @app.route("/")
 def index():
     errors = config_errors()
-    today = date.today()
-    default_start = today - timedelta(days=30)
-    return render_template(
-        "index.html",
-        authenticated=bool(session.get("access_token")),
-        config_errors=errors,
-        **fyers_render_context(),
-        default_start=default_start.isoformat(),
-        default_end=today.isoformat(),
-    )
-
-
-@app.route("/nse-fno-analytics")
-def nse_fno_analytics():
-    errors = config_errors()
     return render_template(
         "nse_fno_analytics.html",
         authenticated=bool(session.get("access_token")),
@@ -136,11 +147,21 @@ def nse_fno_analytics():
     )
 
 
-@app.route("/indicator-screener")
-def indicator_screener():
+@app.route("/healthz")
+def healthz():
+    return jsonify({"ok": True})
+
+
+@app.route("/nse-fno-analytics")
+def nse_fno_analytics():
+    return redirect(url_for("index"))
+
+
+@app.route("/arbitrage-calculator")
+def arbitrage_calculator():
     errors = config_errors()
     return render_template(
-        "indicator_screener.html",
+        "arbitrage_calculator.html",
         authenticated=bool(session.get("access_token")),
         config_errors=errors,
         **fyers_render_context(),
@@ -152,7 +173,7 @@ def login():
     errors = config_errors(include_credentials=True)
     if errors:
         return render_template(
-            "index.html",
+            "nse_fno_analytics.html",
             authenticated=False,
             config_errors=errors,
             **fyers_render_context(),
@@ -167,7 +188,7 @@ def callback():
     auth_code = request.args.get("auth_code") or request.args.get("code")
     if not auth_code:
         return render_template(
-            "index.html",
+            "nse_fno_analytics.html",
             authenticated=False,
             config_errors=["FYERS did not return an auth_code."],
             **fyers_render_context(),
@@ -179,7 +200,7 @@ def callback():
         response = session_model.generate_token()
     except Exception as exc:
         return render_template(
-            "index.html",
+            "nse_fno_analytics.html",
             authenticated=False,
             config_errors=[str(exc)],
             **fyers_render_context(),
@@ -189,7 +210,7 @@ def callback():
     if not access_token:
         message = response.get("message", "Unable to generate FYERS access token.") if isinstance(response, dict) else str(response)
         return render_template(
-            "index.html",
+            "nse_fno_analytics.html",
             authenticated=False,
             config_errors=[message],
             **fyers_render_context(),
@@ -230,62 +251,6 @@ def fyers_config_api():
         return jsonify(config)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
-
-
-@app.route("/api/analyze", methods=["POST"])
-def analyze():
-    payload = request.get_json(silent=True) or {}
-    symbol = (payload.get("symbol") or "").strip().upper()
-    if not symbol:
-        return jsonify({"error": "Enter a FYERS symbol such as NSE:SBIN-EQ, BSE:RELIANCE-A, or MCX:GOLDPETAL26JUNFUT."}), 400
-
-    if not session.get("access_token"):
-        return jsonify({"error": "Login with FYERS before fetching data."}), 401
-
-    try:
-        resolution = resolve_symbol(None, symbol)
-        if not resolution.get("success"):
-            details = {
-                "symbol": symbol,
-                "exchange": resolution.get("exchange") or detect_exchange(symbol),
-                "reason": resolution.get("reason") or "Symbol resolution failed",
-            }
-            return jsonify({"error": details["reason"], "details": details}), 400
-
-        resolved_symbol = resolution["symbol"]
-        options = parse_backtest_options(payload)
-        df = fetch_history(resolved_symbol, options["date_from"], options["date_to"])
-        if df.empty:
-            return jsonify({"error": "FYERS returned no candles for this symbol/date range."}), 404
-
-        trades, metrics = run_por_backtest(
-            df,
-            session_start=options["session_start"],
-            signal_start=options["signal_start"],
-            session_exit=options["session_exit"],
-        )
-        chart = build_chart_payload(df, trades)
-        return jsonify({
-            "symbol": resolved_symbol,
-            "chart": chart,
-            "trades": trades,
-            "metrics": metrics,
-            "options": {
-                "date_from": options["date_from"].isoformat(),
-                "date_to": options["date_to"].isoformat(),
-                "session_start": options["session_start"].strftime("%H:%M"),
-                "signal_start": options["signal_start"].strftime("%H:%M"),
-                "session_exit": options["session_exit"].strftime("%H:%M"),
-            },
-        })
-    except ValueError as exc:
-        details = exc.args[0] if exc.args and isinstance(exc.args[0], dict) else None
-        if details:
-            message = details.get("reason") or str(exc)
-            return jsonify({"error": message, "details": details}), 400
-        return jsonify({"error": str(exc)}), 400
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
 
 
 @app.route("/api/symbol-search")
@@ -375,26 +340,29 @@ def nse_fno_analytics_data():
         return jsonify({"error": str(exc)}), 500
 
 
-@app.route("/api/indicator-screener/metadata")
-def indicator_screener_metadata():
-    warnings = []
-    catalog_items = []
+@app.route("/api/arbitrage/metadata")
+def arbitrage_metadata():
     try:
-        catalog = get_fno_contract_catalog()
-        catalog_items = catalog["items"]
+        equity_catalog = get_fno_contract_catalog()
+        commodity_catalog = get_commodity_futures_catalog()
+        return jsonify({
+            "generated_at": datetime.now(IST).isoformat(),
+            "refresh_interval_seconds": ARBITRAGE_AUTO_REFRESH_SECONDS,
+            "equitySymbols": build_arbitrage_symbol_metadata(equity_catalog["items"], "equity"),
+            "commoditySymbols": build_arbitrage_symbol_metadata(commodity_catalog["items"], "commodity"),
+            "chargeRules": {
+                "equity": equity_charge_rules(),
+                "commodity": commodity_charge_rules(),
+            },
+        })
     except Exception as exc:
-        warnings.append(f"Unable to load live F&O catalog: {exc}")
-
-    metadata = get_screener_metadata(catalog_items)
-    metadata["warnings"] = warnings
-    return jsonify(metadata)
+        return jsonify({"error": str(exc)}), 500
 
 
-@app.route("/api/indicator-screener/scan", methods=["POST"])
-def indicator_screener_scan():
-    access_token = session.get("access_token")
-    if not access_token:
-        return jsonify({"error": "Login with FYERS before running the indicator screener."}), 401
+@app.route("/api/arbitrage/calculate", methods=["POST"])
+def arbitrage_calculate():
+    if not session.get("access_token"):
+        return jsonify({"error": "Login with FYERS before calculating live arbitrage."}), 401
 
     errors = config_errors()
     if errors:
@@ -402,178 +370,516 @@ def indicator_screener_scan():
 
     payload = request.get_json(silent=True) or {}
     try:
-        catalog = get_fno_contract_catalog()
-
-        def history_fetcher(symbol, resolution, date_from, date_to):
-            return fetch_history_with_token(access_token, symbol, resolution, date_from, date_to)
-
-        result = run_indicator_screener(payload, catalog, history_fetcher)
-        return jsonify(result)
+        market_type = str(payload.get("marketType") or "equity").strip().lower()
+        if market_type == "commodity":
+            return jsonify(calculate_commodity_arbitrage(payload, get_commodity_futures_catalog()))
+        if market_type == "equity":
+            return jsonify(calculate_equity_arbitrage(payload, get_fno_contract_catalog()))
+        raise ValueError("Select either equity cash-futures or commodity futures.")
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
 
-@app.route("/api/export", methods=["POST"])
-def export_trades():
-    payload = request.get_json(silent=True) or {}
-    trades = payload.get("trades") or []
-    metrics = payload.get("metrics") or {}
-    symbol = (payload.get("symbol") or "trades").replace(":", "_").replace("/", "_")
-    options = payload.get("options") or {}
-
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        trades_df = pd.DataFrame(trades)
-        if trades_df.empty:
-            trades_df = pd.DataFrame(columns=[
-                "side", "entry_time", "entry_price", "exit_time", "exit_price", "exit_reason", "pnl", "por"
-            ])
-        trades_df.to_excel(writer, sheet_name="Trades", index=False)
-
-        summary_rows = [
-            {"metric": "symbol", "value": payload.get("symbol", "")},
-            {"metric": "date_from", "value": options.get("date_from", "")},
-            {"metric": "date_to", "value": options.get("date_to", "")},
-            {"metric": "session_start", "value": options.get("session_start", "")},
-            {"metric": "signal_start", "value": options.get("signal_start", "")},
-            {"metric": "session_exit", "value": options.get("session_exit", "")},
-            {"metric": "total_pnl", "value": metrics.get("total_pnl", 0)},
-            {"metric": "win_rate", "value": metrics.get("win_rate", 0)},
-            {"metric": "drawdown", "value": metrics.get("drawdown", 0)},
-            {"metric": "trade_count", "value": metrics.get("trade_count", 0)},
-        ]
-        pd.DataFrame(summary_rows).to_excel(writer, sheet_name="Summary", index=False)
-
-    output.seek(0)
-    filename = f"{symbol}_por_trades.xlsx"
-    return send_file(
-        output,
-        as_attachment=True,
-        download_name=filename,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-
-@app.route("/api/indicator-screener/export", methods=["POST"])
-def export_indicator_screener():
-    payload = request.get_json(silent=True) or {}
-    rows = payload.get("rows") or []
-    scan = payload.get("scan") or {}
-    generated_at = payload.get("generated_at") or ""
-    export_format = (payload.get("format") or "xlsx").lower()
-    exported_at = datetime.now(IST).isoformat()
-    export_rows = build_indicator_export_rows(rows, scan, generated_at, exported_at)
-    safe_stamp = datetime.now(IST).strftime("%Y%m%d_%H%M%S")
-
-    if export_format == "csv":
-        output = BytesIO()
-        csv_text = pd.DataFrame(export_rows).to_csv(index=False)
-        output.write(csv_text.encode("utf-8-sig"))
-        output.seek(0)
-        return send_file(
-            output,
-            as_attachment=True,
-            download_name=f"Advanced_FO_Indicator_Screener_{safe_stamp}.csv",
-            mimetype="text/csv",
-        )
-
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        pd.DataFrame(export_rows).to_excel(writer, sheet_name="Screener Results", index=False)
-        pd.DataFrame(build_indicator_export_summary(scan, rows, generated_at, exported_at)).to_excel(
-            writer,
-            sheet_name="Scan Summary",
-            index=False,
-        )
-
-    output.seek(0)
-    return send_file(
-        output,
-        as_attachment=True,
-        download_name=f"Advanced_FO_Indicator_Screener_{safe_stamp}.xlsx",
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-
-def build_indicator_export_rows(rows, scan, generated_at, exported_at):
-    filters = indicator_scan_filter_text(scan)
-    conditions = indicator_condition_text(scan.get("conditions") or [])
-    return [
-        {
-            "Exported At": exported_at,
-            "Data Timestamp": generated_at,
-            "Selected Filters": filters,
-            "Indicator Conditions": conditions,
-            "Condition Timeframes": ", ".join(row.get("conditionTimeframes") or []) if row.get("conditionTimeframes") else "",
-            "Logic": scan.get("logic", "AND"),
-            "Stock Name": row.get("stockName"),
-            "Symbol": row.get("symbol"),
-            "Sector": row.get("sector"),
-            "Instrument Type": row.get("instrumentType"),
-            "FYERS Symbol": row.get("fyersSymbol"),
-            "Current Price": row.get("currentPrice"),
-            "RSI": row.get("rsi"),
-            "ADX": row.get("adx"),
-            "Supertrend Status": row.get("supertrendStatus"),
-            "VWAP Status": row.get("vwapStatus"),
-            "Bollinger Status": row.get("bollingerStatus"),
-            "Signal Strength": row.get("signalStrength"),
-            "Signal Bias": row.get("signalBias"),
-            "Primary Timeframe": row.get("primaryTimeframe"),
-            "Timeframe": row.get("timeframe"),
-            "Volume": row.get("volume"),
-            "Volume Breakout Ratio": row.get("volumeBreakoutRatio"),
-            "Last Updated": row.get("lastUpdated"),
-        }
-        for row in rows
-    ]
-
-
-def build_indicator_export_summary(scan, rows, generated_at, exported_at):
-    return [
-        {"Metric": "Exported At", "Value": exported_at},
-        {"Metric": "Data Timestamp", "Value": generated_at},
-        {"Metric": "Selected Filters", "Value": indicator_scan_filter_text(scan)},
-        {"Metric": "Default Timeframe", "Value": scan.get("defaultTimeframeLabel") or scan.get("timeframeLabel") or scan.get("timeframe") or ""},
-        {"Metric": "Condition Timeframes", "Value": indicator_condition_timeframes_text(scan.get("conditions") or [])},
-        {"Metric": "Logic", "Value": scan.get("logic", "AND")},
-        {"Metric": "Indicator Conditions", "Value": indicator_condition_text(scan.get("conditions") or [])},
-        {"Metric": "Result Count", "Value": len(rows)},
-    ]
-
-
-def indicator_scan_filter_text(scan):
-    return " | ".join([
-        f"Instruments: {', '.join(scan.get('instrumentTypes') or [])}",
-        f"Sectors: {', '.join(scan.get('sectors') or [])}",
-        f"Timeframe: {scan.get('timeframeLabel') or scan.get('timeframe') or ''}",
-    ])
-
-
-def indicator_condition_text(conditions):
-    if not conditions:
-        return "No explicit indicator conditions"
-    parts = []
-    for condition in conditions:
-        value = condition.get("value")
-        value_text = "" if value in (None, "") else f" {value}"
-        timeframe_text = condition.get("timeframeLabel") or condition.get("timeframe") or ""
-        suffix = f" @ {timeframe_text}" if timeframe_text else ""
-        parts.append(f"{condition.get('indicator')} {condition.get('operator')}{value_text}{suffix}")
-    return "; ".join(parts)
-
-
-def indicator_condition_timeframes_text(conditions):
-    labels = []
-    for condition in conditions:
-        label = condition.get("timeframeLabel") or condition.get("timeframe")
-        if label and label not in labels:
-            labels.append(label)
-    return ", ".join(labels)
-
-
 def get_fno_contract_catalog():
     return build_fno_contract_catalog()
+
+
+def build_arbitrage_symbol_metadata(catalog_items, market_type):
+    return [
+        {
+            "symbol": item["symbol"],
+            "stockName": item["stock_name"],
+            "spotSymbol": item.get("spot_symbol"),
+            "exchange": item.get("exchange") or "NSE",
+            "marketType": market_type,
+            "lotSize": item["lot_size"],
+            "contracts": [
+                {
+                    "key": key,
+                    "label": "Stock Future" if market_type == "equity" else "Commodity Future",
+                    "futureSymbol": contract["fyers_symbol"],
+                    "expiry": contract["expiry"],
+                    "expiryTs": contract.get("expiry_ts"),
+                    "lotSize": contract.get("lot_size"),
+                    "exchange": contract.get("exchange") or item.get("exchange") or "NSE",
+                }
+                for key, contract in item["contracts"].items()
+            ],
+        }
+        for item in catalog_items
+    ]
+
+
+def calculate_equity_arbitrage(payload, catalog):
+    buy_item = find_arbitrage_item(catalog, payload.get("buySymbol"))
+    if not buy_item:
+        raise ValueError("Select a valid F&O stock to buy.")
+
+    sell_item = find_arbitrage_item(catalog, payload.get("sellSymbol") or payload.get("buySymbol"))
+    if not sell_item:
+        raise ValueError("Select a valid F&O stock future to sell.")
+
+    contract = find_arbitrage_contract(
+        sell_item,
+        payload.get("futureContract") or payload.get("futureExpiry"),
+    )
+    if not contract:
+        raise ValueError("Select a valid futures expiry for the sell leg.")
+
+    lots = parse_positive_int(payload.get("lots"), "Lots")
+    rates = dict(EQUITY_CASH_FUTURES_RATES)
+    quotes, quote_warnings = fetch_fyers_quotes([
+        buy_item["spot_symbol"],
+        contract["fyers_symbol"],
+    ])
+    spot_price = extract_quote_price(quotes.get(buy_item["spot_symbol"]))
+    future_price = extract_quote_price(quotes.get(contract["fyers_symbol"]))
+    if spot_price is None:
+        raise ValueError(f"FYERS did not return a live spot price for {buy_item['spot_symbol']}.")
+    if future_price is None:
+        raise ValueError(f"FYERS did not return a live futures price for {contract['fyers_symbol']}.")
+
+    settlement_price = parse_float(payload.get("settlementPrice"))
+    if settlement_price is None or settlement_price <= 0:
+        settlement_price = spot_price
+
+    warnings = list(quote_warnings or [])
+    if buy_item["symbol"] != sell_item["symbol"]:
+        warnings.append("Buy stock and sell future are different underlyings; hedge and return estimates may not behave like cash-futures arbitrage.")
+
+    lot_size = int(contract.get("lot_size") or sell_item.get("lot_size") or 0)
+    if lot_size <= 0:
+        raise ValueError("Could not read lot size for the selected futures contract.")
+
+    quantity = lot_size * lots
+    turnover = build_arbitrage_turnover(spot_price, future_price, settlement_price, quantity)
+    charges = calculate_equity_cash_futures_charges(turnover, rates)
+    gross_profit = round_money(turnover["stockSell"] - turnover["stockBuy"] + turnover["futureSell"] - turnover["futureBuy"])
+    net_profit = round_money(gross_profit - charges["total"])
+    future_margin = pct_amount(turnover["futureSell"], rates["futuresMarginPct"])
+    cash_required = round_money(turnover["stockBuy"] + future_margin + charges["opening"])
+    gross_return_pct = percentage_of(gross_profit, cash_required)
+    net_return_pct = percentage_of(net_profit, cash_required)
+    days_to_expiry = days_until_expiry(contract.get("expiry_ts"))
+
+    return {
+        "marketType": "equity",
+        "generated_at": datetime.now(IST).isoformat(),
+        "warnings": warnings,
+        "rates": rates,
+        "chargeRules": equity_charge_rules(),
+        "inputs": {
+            "buySymbol": buy_item["symbol"],
+            "sellSymbol": sell_item["symbol"],
+            "lots": lots,
+            "settlementPrice": settlement_price,
+        },
+        "instruments": {
+            "buyStock": {
+                "symbol": buy_item["symbol"],
+                "stockName": buy_item["stock_name"],
+                "spotSymbol": buy_item["spot_symbol"],
+            },
+            "sellFuture": {
+                "symbol": sell_item["symbol"],
+                "stockName": sell_item["stock_name"],
+                "futureSymbol": contract["fyers_symbol"],
+                "expiry": contract["expiry"],
+                "expiryTs": contract.get("expiry_ts"),
+            },
+        },
+        "prices": {
+            "spotPrice": spot_price,
+            "futurePrice": future_price,
+            "settlementPrice": settlement_price,
+            "grossSpreadPerShare": round_money(future_price - spot_price),
+            "grossSpreadPct": percentage_difference(future_price, spot_price),
+            "breakEvenSpreadPerShare": round_money(charges["total"] / quantity),
+        },
+        "quantity": {
+            "lotSize": lot_size,
+            "lots": lots,
+            "shares": quantity,
+            "daysToExpiry": days_to_expiry,
+        },
+        "turnover": turnover,
+        "charges": charges,
+        "result": {
+            "grossProfit": gross_profit,
+            "netProfit": net_profit,
+            "cashRequired": cash_required,
+            "futureMargin": future_margin,
+            "grossReturnPct": gross_return_pct,
+            "netReturnPct": net_return_pct,
+            "annualizedNetReturnPct": annualized_return(net_return_pct, days_to_expiry),
+        },
+    }
+
+
+def calculate_commodity_arbitrage(payload, catalog):
+    buy_item = find_arbitrage_item(catalog, payload.get("buySymbol"))
+    sell_item = find_arbitrage_item(catalog, payload.get("sellSymbol") or payload.get("buySymbol"))
+    if not buy_item or not sell_item:
+        raise ValueError("Select valid commodity futures for both the buy and sell legs.")
+
+    # A commodity calendar spread needs the same underlying and exchange. It
+    # prevents a misleading difference between unrelated units such as crude oil
+    # and gold, or MCX and NSE contracts.
+    if buy_item["symbol"] != sell_item["symbol"]:
+        raise ValueError("Select buy and sell futures for the same commodity and exchange.")
+
+    buy_contract = find_arbitrage_contract(buy_item, payload.get("buyFutureContract"))
+    sell_contract = find_arbitrage_contract(sell_item, payload.get("sellFutureContract"))
+    if not buy_contract or not sell_contract:
+        raise ValueError("Select valid commodity-futures expiries for both legs.")
+    if buy_contract["fyers_symbol"] == sell_contract["fyers_symbol"]:
+        raise ValueError("Select two different commodity-futures expiries to calculate a spread.")
+
+    buy_lot_size = int(buy_contract.get("lot_size") or 0)
+    sell_lot_size = int(sell_contract.get("lot_size") or 0)
+    if buy_lot_size <= 0 or sell_lot_size <= 0:
+        raise ValueError("Could not read the lot size for the selected commodity futures.")
+    if buy_lot_size != sell_lot_size:
+        raise ValueError("The selected commodity futures have different lot sizes and cannot be compared as one spread.")
+
+    lots = parse_positive_int(payload.get("lots"), "Lots")
+    commodity_class = str(payload.get("commodityClass") or "non_agri").strip().lower()
+    if commodity_class not in {"agri", "non_agri"}:
+        raise ValueError("Select whether the commodity is agricultural or non-agricultural.")
+
+    quotes, quote_warnings = fetch_fyers_quotes([
+        buy_contract["fyers_symbol"],
+        sell_contract["fyers_symbol"],
+    ])
+    buy_future_price = extract_quote_price(quotes.get(buy_contract["fyers_symbol"]))
+    sell_future_price = extract_quote_price(quotes.get(sell_contract["fyers_symbol"]))
+    if buy_future_price is None:
+        raise ValueError(f"FYERS did not return a live price for {buy_contract['fyers_symbol']}.")
+    if sell_future_price is None:
+        raise ValueError(f"FYERS did not return a live price for {sell_contract['fyers_symbol']}.")
+
+    quantity = buy_lot_size * lots
+    turnover = {
+        "futureBuy": round_money(buy_future_price * quantity),
+        "futureSell": round_money(sell_future_price * quantity),
+        "total": round_money((buy_future_price + sell_future_price) * quantity),
+    }
+    rates = commodity_futures_rates(buy_item["exchange"], commodity_class)
+    charges = calculate_commodity_futures_charges(turnover, rates)
+    gross_difference = round_money(turnover["futureSell"] - turnover["futureBuy"])
+    net_difference = round_money(gross_difference - charges["total"])
+    future_margin = pct_amount(turnover["total"], rates["futuresMarginPct"])
+    cash_required = round_money(future_margin + charges["opening"])
+    expiry_days = [
+        value for value in (
+            days_until_expiry(buy_contract.get("expiry_ts")),
+            days_until_expiry(sell_contract.get("expiry_ts")),
+        ) if value is not None
+    ]
+    days_to_expiry = min(expiry_days) if expiry_days else None
+
+    return {
+        "marketType": "commodity",
+        "generated_at": datetime.now(IST).isoformat(),
+        "warnings": list(quote_warnings or []) + [
+            "The displayed net difference is the current calendar-spread value after entry charges; it is not a guaranteed settlement profit.",
+            "Margin is indicative. Actual commodity spread margin is determined by FYERS and the exchange.",
+        ],
+        "rates": rates,
+        "chargeRules": commodity_charge_rules(),
+        "inputs": {
+            "buySymbol": buy_item["symbol"],
+            "sellSymbol": sell_item["symbol"],
+            "lots": lots,
+            "commodityClass": commodity_class,
+        },
+        "instruments": {
+            "buyFuture": {
+                "symbol": buy_item["root_symbol"],
+                "stockName": buy_item["stock_name"],
+                "futureSymbol": buy_contract["fyers_symbol"],
+                "expiry": buy_contract["expiry"],
+                "expiryTs": buy_contract.get("expiry_ts"),
+                "exchange": buy_item["exchange"],
+            },
+            "sellFuture": {
+                "symbol": sell_item["root_symbol"],
+                "stockName": sell_item["stock_name"],
+                "futureSymbol": sell_contract["fyers_symbol"],
+                "expiry": sell_contract["expiry"],
+                "expiryTs": sell_contract.get("expiry_ts"),
+                "exchange": sell_item["exchange"],
+            },
+        },
+        "prices": {
+            "buyFuturePrice": buy_future_price,
+            "sellFuturePrice": sell_future_price,
+            "grossSpreadPerShare": round_money(sell_future_price - buy_future_price),
+            "grossSpreadPct": percentage_difference(sell_future_price, buy_future_price),
+            "breakEvenSpreadPerShare": round_money(charges["total"] / quantity),
+        },
+        "quantity": {
+            "lotSize": buy_lot_size,
+            "lots": lots,
+            "shares": quantity,
+            "daysToExpiry": days_to_expiry,
+        },
+        "turnover": turnover,
+        "charges": charges,
+        "result": {
+            "grossProfit": gross_difference,
+            "netProfit": net_difference,
+            "cashRequired": cash_required,
+            "futureMargin": future_margin,
+            "grossReturnPct": percentage_of(gross_difference, cash_required),
+            "netReturnPct": percentage_of(net_difference, cash_required),
+            "annualizedNetReturnPct": None,
+        },
+    }
+
+
+def find_arbitrage_item(catalog, value):
+    cleaned = clean_root_symbol(value)
+    value_text = str(value or "").strip().upper()
+    if not cleaned and not value_text:
+        return None
+
+    for item in catalog.get("items", []):
+        symbol = item["symbol"].upper()
+        stock_name = item["stock_name"].upper()
+        root_symbol = str(item.get("root_symbol") or "").upper()
+        spot_symbol = str(item.get("spot_symbol") or "").upper()
+        if cleaned in {symbol, root_symbol} or value_text in {symbol, spot_symbol, stock_name, root_symbol}:
+            return item
+        if value_text and value_text in stock_name:
+            return item
+        for contract in item["contracts"].values():
+            if value_text == contract["fyers_symbol"].upper():
+                return item
+    return None
+
+
+def find_arbitrage_contract(item, value):
+    contracts = item.get("contracts") or {}
+    requested = str(value or "").strip()
+    if not requested:
+        return contracts.get("near")
+    if requested in contracts:
+        return contracts[requested]
+
+    requested_upper = requested.upper()
+    for contract in contracts.values():
+        aliases = {
+            contract["fyers_symbol"].upper(),
+            str(contract.get("expiry") or "").upper(),
+            str(contract.get("expiry_ts") or "").upper(),
+        }
+        if requested_upper in aliases:
+            return contract
+    return None
+
+
+def build_arbitrage_turnover(spot_price, future_price, settlement_price, quantity):
+    stock_buy = round_money(spot_price * quantity)
+    future_sell = round_money(future_price * quantity)
+    stock_sell = round_money(settlement_price * quantity)
+    future_buy = round_money(settlement_price * quantity)
+    return {
+        "stockBuy": stock_buy,
+        "futureSell": future_sell,
+        "stockSell": stock_sell,
+        "futureBuy": future_buy,
+        "total": round_money(stock_buy + future_sell + stock_sell + future_buy),
+    }
+
+
+def calculate_equity_cash_futures_charges(turnover, rates):
+    equity_buy_brokerage = 0
+    equity_sell_brokerage = 0
+    future_sell_brokerage = capped_brokerage(turnover["futureSell"], rates)
+    future_buy_brokerage = capped_brokerage(turnover["futureBuy"], rates)
+
+    equity_buy_stt = pct_amount(turnover["stockBuy"], rates["equitySttBuyPct"])
+    equity_sell_stt = pct_amount(turnover["stockSell"], rates["equitySttSellPct"])
+    future_sell_stt = pct_amount(turnover["futureSell"], rates["futuresSttSellPct"])
+
+    equity_buy_stamp = pct_amount(turnover["stockBuy"], rates["equityStampBuyPct"])
+    future_buy_stamp = pct_amount(turnover["futureBuy"], rates["futuresStampBuyPct"])
+
+    equity_buy_exchange = pct_amount(turnover["stockBuy"], rates["equityExchangePct"])
+    equity_sell_exchange = pct_amount(turnover["stockSell"], rates["equityExchangePct"])
+    future_sell_exchange = pct_amount(turnover["futureSell"], rates["futuresExchangePct"])
+    future_buy_exchange = pct_amount(turnover["futureBuy"], rates["futuresExchangePct"])
+
+    equity_buy_sebi = pct_amount(turnover["stockBuy"], rates["sebiTurnoverPct"])
+    equity_sell_sebi = pct_amount(turnover["stockSell"], rates["sebiTurnoverPct"])
+    future_sell_sebi = pct_amount(turnover["futureSell"], rates["sebiTurnoverPct"])
+    future_buy_sebi = pct_amount(turnover["futureBuy"], rates["sebiTurnoverPct"])
+
+    opening_gst_base = round_money(
+        equity_buy_brokerage
+        + future_sell_brokerage
+        + equity_buy_exchange
+        + future_sell_exchange
+        + equity_buy_sebi
+        + future_sell_sebi
+    )
+    closing_gst_base = round_money(
+        equity_sell_brokerage
+        + future_buy_brokerage
+        + equity_sell_exchange
+        + future_buy_exchange
+        + equity_sell_sebi
+        + future_buy_sebi
+    )
+    opening_gst = pct_amount(opening_gst_base, rates["gstPct"])
+    closing_gst = pct_amount(closing_gst_base, rates["gstPct"])
+
+    opening = round_money(
+        equity_buy_brokerage
+        + future_sell_brokerage
+        + equity_buy_stt
+        + future_sell_stt
+        + equity_buy_stamp
+        + equity_buy_exchange
+        + future_sell_exchange
+        + equity_buy_sebi
+        + future_sell_sebi
+        + opening_gst
+    )
+    closing = round_money(
+        equity_sell_brokerage
+        + future_buy_brokerage
+        + equity_sell_stt
+        + future_buy_stamp
+        + equity_sell_exchange
+        + future_buy_exchange
+        + equity_sell_sebi
+        + future_buy_sebi
+        + closing_gst
+    )
+
+    brokerage = round_money(equity_buy_brokerage + equity_sell_brokerage + future_sell_brokerage + future_buy_brokerage)
+    stt = round_money(equity_buy_stt + equity_sell_stt + future_sell_stt)
+    stamp = round_money(equity_buy_stamp + future_buy_stamp)
+    exchange = round_money(equity_buy_exchange + equity_sell_exchange + future_sell_exchange + future_buy_exchange)
+    sebi = round_money(equity_buy_sebi + equity_sell_sebi + future_sell_sebi + future_buy_sebi)
+    gst = round_money(opening_gst + closing_gst)
+
+    return {
+        "opening": opening,
+        "closing": closing,
+        "total": round_money(opening + closing),
+        "breakdown": [
+            {"label": "Brokerage", "amount": brokerage},
+            {"label": "STT", "amount": stt},
+            {"label": "Stamp Duty", "amount": stamp},
+            {"label": "Exchange Transaction Charges", "amount": exchange},
+            {"label": "SEBI Turnover Fees", "amount": sebi},
+            {"label": "GST", "amount": gst},
+        ],
+        "legs": [
+            {"label": "Buy Stock Charges", "amount": round_money(equity_buy_brokerage + equity_buy_stt + equity_buy_stamp + equity_buy_exchange + equity_buy_sebi)},
+            {"label": "Sell Future Charges", "amount": round_money(future_sell_brokerage + future_sell_stt + future_sell_exchange + future_sell_sebi)},
+            {"label": "Sell Stock Charges", "amount": round_money(equity_sell_brokerage + equity_sell_stt + equity_sell_exchange + equity_sell_sebi)},
+            {"label": "Buy/Settle Future Charges", "amount": round_money(future_buy_brokerage + future_buy_stamp + future_buy_exchange + future_buy_sebi)},
+            {"label": "GST on Charges", "amount": gst},
+        ],
+    }
+
+
+def capped_brokerage(turnover, rates):
+    return round_money(min(
+        pct_amount(turnover, rates["futuresBrokeragePct"]),
+        rates["futuresBrokerageCapPerOrder"],
+    ))
+
+
+def commodity_futures_rates(exchange, commodity_class):
+    rates = dict(COMMODITY_FUTURES_RATES)
+    rates["exchange"] = exchange
+    rates["commodityClass"] = commodity_class
+    rates["futuresExchangePct"] = (
+        rates["mcxExchangePct"] if exchange == "MCX" else rates["nseCommodityExchangePct"]
+    )
+    rates["sebiTurnoverPct"] = (
+        rates["sebiAgriTurnoverPct"] if commodity_class == "agri" else rates["sebiNonAgriTurnoverPct"]
+    )
+    return rates
+
+
+def calculate_commodity_futures_charges(turnover, rates):
+    future_buy_brokerage = capped_brokerage(turnover["futureBuy"], rates)
+    future_sell_brokerage = capped_brokerage(turnover["futureSell"], rates)
+    future_sell_ctt = (
+        pct_amount(turnover["futureSell"], rates["futuresCttSellPct"])
+        if rates["commodityClass"] == "non_agri" else 0
+    )
+    future_buy_stamp = pct_amount(turnover["futureBuy"], rates["futuresStampBuyPct"])
+    future_buy_exchange = pct_amount(turnover["futureBuy"], rates["futuresExchangePct"])
+    future_sell_exchange = pct_amount(turnover["futureSell"], rates["futuresExchangePct"])
+    future_buy_sebi = pct_amount(turnover["futureBuy"], rates["sebiTurnoverPct"])
+    future_sell_sebi = pct_amount(turnover["futureSell"], rates["sebiTurnoverPct"])
+    gst_base = round_money(
+        future_buy_brokerage
+        + future_sell_brokerage
+        + future_buy_exchange
+        + future_sell_exchange
+        + future_buy_sebi
+        + future_sell_sebi
+    )
+    gst = pct_amount(gst_base, rates["gstPct"])
+    opening = round_money(
+        future_buy_brokerage
+        + future_sell_brokerage
+        + future_sell_ctt
+        + future_buy_stamp
+        + future_buy_exchange
+        + future_sell_exchange
+        + future_buy_sebi
+        + future_sell_sebi
+        + gst
+    )
+    brokerage = round_money(future_buy_brokerage + future_sell_brokerage)
+    exchange = round_money(future_buy_exchange + future_sell_exchange)
+    sebi = round_money(future_buy_sebi + future_sell_sebi)
+
+    return {
+        "opening": opening,
+        "closing": 0,
+        "total": opening,
+        "breakdown": [
+            {"label": "Brokerage", "amount": brokerage},
+            {"label": "CTT (sell side)", "amount": future_sell_ctt},
+            {"label": "Stamp Duty (buy side)", "amount": future_buy_stamp},
+            {"label": f"{rates['exchange']} Transaction Charges", "amount": exchange},
+            {"label": "SEBI Turnover Fees", "amount": sebi},
+            {"label": "GST", "amount": gst},
+        ],
+        "legs": [
+            {"label": "Buy Commodity Future Charges", "amount": round_money(future_buy_brokerage + future_buy_stamp + future_buy_exchange + future_buy_sebi)},
+            {"label": "Sell Commodity Future Charges", "amount": round_money(future_sell_brokerage + future_sell_ctt + future_sell_exchange + future_sell_sebi)},
+            {"label": "GST on Charges", "amount": gst},
+        ],
+    }
+
+
+def equity_charge_rules():
+    return [
+        "Cash equity delivery: zero brokerage; STT 0.10% on buy and sell; NSE transaction charge 0.00307%; stamp duty 0.015% on buy.",
+        "NSE stock futures: brokerage 0.03% or Rs. 20 per executed order, whichever is lower; STT 0.05% on sell; transaction charge 0.00183%; stamp duty 0.002% on buy.",
+        "SEBI turnover fee is Rs. 10 per crore and GST is 18% of brokerage, exchange transaction charges and SEBI fees.",
+    ]
+
+
+def commodity_charge_rules():
+    return [
+        "Commodity futures: brokerage 0.03% or Rs. 20 per executed order, whichever is lower; CTT 0.01% on the sell side for non-agri commodities.",
+        "Transaction charge: MCX 0.0021% or NSE commodity 0.0001%; stamp duty 0.002% on the buy side.",
+        "SEBI turnover fee is Rs. 10 per crore for non-agri or Rs. 1 per crore for agri commodities; GST is 18% of brokerage, exchange transaction charges and SEBI fees.",
+    ]
 
 
 def fetch_fno_analytics_rows(catalog_items):
@@ -777,107 +1083,50 @@ def parse_float(value):
         return None
 
 
-def fetch_history(symbol, date_from=None, date_to=None):
-    return fetch_history_with_token(session.get("access_token"), symbol, "5", date_from, date_to)
+def parse_positive_int(value, label):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} must be a whole number.")
+    if parsed < 1:
+        raise ValueError(f"{label} must be at least 1.")
+    return parsed
 
 
-def fetch_history_with_token(token, symbol, resolution="5", date_from=None, date_to=None):
-    resolution_result = resolve_symbol(None, symbol)
-    if not resolution_result.get("success"):
-        raise ValueError({
-            "symbol": symbol,
-            "exchange": resolution_result.get("exchange") or detect_exchange(symbol),
-            "reason": resolution_result.get("reason") or "Symbol not found in loaded FYERS symbol master",
-        })
-    symbol = resolution_result["symbol"]
-
-    fyers = make_fyers_client(token)
-    today = datetime.now().date()
-    start = date_from or (today - timedelta(days=30))
-    end = date_to or today
-    request_payload = {
-        "symbol": symbol,
-        "resolution": resolution,
-        "date_format": "1",
-        "range_from": start.strftime("%Y-%m-%d"),
-        "range_to": end.strftime("%Y-%m-%d"),
-        "cont_flag": "1",
-    }
-
-    response = None
-    for attempt in range(3):
-        response = fyers.history(data=request_payload)
-        if isinstance(response, dict) and response.get("s") == "ok":
-            break
-        message = (response.get("message") or response.get("code")) if isinstance(response, dict) else str(response)
-        if "request limit" in str(message).lower() and attempt < 2:
-            sleep_for = 1.5 * (attempt + 1)
-            logger.warning("FYERS history rate limit for %s %s; retrying in %.1fs", symbol, resolution, sleep_for)
-            time.sleep(sleep_for)
-            continue
-        break
-
-    if not isinstance(response, dict):
-        raise RuntimeError(f"Unexpected FYERS response: {response}")
-    if response.get("s") != "ok":
-        message = response.get("message") or response.get("code") or "FYERS history request failed."
-        logger.warning("FYERS history failed for %s %s: %s", symbol, resolution, message)
-        raise RuntimeError(message)
-
-    candles = response.get("candles", [])
-    df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    if df.empty:
-        return df
-
-    df["datetime"] = parse_fyers_timestamps(df["timestamp"])
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df.dropna(subset=["datetime", "open", "high", "low", "close"]).sort_values("datetime").reset_index(drop=True)
+def pct_amount(base, pct):
+    if base is None or pct is None:
+        return 0
+    return round_money(float(base) * float(pct) / 100)
 
 
-def parse_backtest_options(payload):
-    today = datetime.now().date()
-    default_start = today - timedelta(days=30)
-    date_from = parse_date(payload.get("date_from"), default_start)
-    date_to = parse_date(payload.get("date_to"), today)
-    if date_from > date_to:
-        raise ValueError("Start date cannot be after end date.")
-
-    session_start = parse_time_value(payload.get("session_start"), "09:15")
-    signal_start = parse_time_value(payload.get("signal_start"), "09:20")
-    session_exit = parse_time_value(payload.get("session_exit"), "15:15")
-    if not (session_start < signal_start <= session_exit):
-        raise ValueError("Times must follow: session start < signal start <= exit time.")
-
-    return {
-        "date_from": date_from,
-        "date_to": date_to,
-        "session_start": session_start,
-        "signal_start": signal_start,
-        "session_exit": session_exit,
-    }
+def percentage_of(value, base):
+    if base in (None, 0):
+        return None
+    return round((float(value) / float(base)) * 100, 4)
 
 
-def parse_date(value, default):
-    if not value:
-        return default
-    return datetime.strptime(value, "%Y-%m-%d").date()
+def annualized_return(return_pct, days):
+    if return_pct is None or not days or days <= 0:
+        return None
+    growth = 1 + (return_pct / 100)
+    if growth <= 0:
+        return None
+    return round((growth ** (365 / days) - 1) * 100, 4)
 
 
-def parse_time_value(value, default):
-    return datetime.strptime(value or default, "%H:%M").time()
+def days_until_expiry(expiry_ts):
+    expiry_value = parse_float(expiry_ts)
+    if expiry_value is None:
+        return None
+    expiry_date = datetime.fromtimestamp(expiry_value, IST).date()
+    return max(0, (expiry_date - datetime.now(IST).date()).days)
 
 
-def parse_fyers_timestamps(series):
-    numeric = pd.to_numeric(series, errors="coerce")
-    if numeric.notna().all():
-        return pd.to_datetime(numeric, unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
-    parsed = pd.to_datetime(series, errors="coerce")
-    if parsed.dt.tz is None:
-        return parsed.dt.tz_localize("Asia/Kolkata")
-    return parsed.dt.tz_convert("Asia/Kolkata")
+def round_money(value):
+    return round(float(value or 0), 2)
 
 
 if __name__ == "__main__":
     debug = os.getenv("FLASK_DEBUG", "0").lower() in {"1", "true", "yes"}
-    app.run(host="127.0.0.1", port=5000, debug=debug)
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=debug)
