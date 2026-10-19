@@ -449,3 +449,4 @@ These values are surfaced in logs and help confirm whether the scan is behaving 
 - There is no separate frontend build step. The app uses Flask, Jinja templates, and static JavaScript files directly.
 - The screener computes indicators from candle history instead of asking FYERS for each indicator separately.
 - If you change FYERS credentials, keep `.env` or the FYERS Credentials panel aligned with the FYERS app you registered.
+"# analysis" 
